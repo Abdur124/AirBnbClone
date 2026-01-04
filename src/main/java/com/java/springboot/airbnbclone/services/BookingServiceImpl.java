@@ -1,5 +1,6 @@
 package com.java.springboot.airbnbclone.services;
 
+import com.fasterxml.jackson.databind.util.JSONPObject;
 import com.java.springboot.airbnbclone.dtos.BookingDto;
 import com.java.springboot.airbnbclone.dtos.BookingRequest;
 import com.java.springboot.airbnbclone.dtos.GuestDto;
@@ -7,10 +8,17 @@ import com.java.springboot.airbnbclone.entities.*;
 import com.java.springboot.airbnbclone.entities.enums.BookingStatus;
 import com.java.springboot.airbnbclone.exceptions.ResourceNotFoundException;
 import com.java.springboot.airbnbclone.repos.*;
+import com.java.springboot.airbnbclone.strategy.PricingService;
+import com.stripe.model.Event;
+import com.stripe.model.EventDataObjectDeserializer;
+import com.stripe.model.StripeObject;
+import com.stripe.model.checkout.Session;
 import jakarta.transaction.Transactional;
 import lombok.extern.slf4j.Slf4j;
+import org.json.JSONObject;
 import org.modelmapper.ModelMapper;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 
@@ -39,9 +47,19 @@ public class BookingServiceImpl implements BookingService {
     private GuestRepository guestRepository;
 
     @Autowired
+    private CheckoutService checkoutService;
+
+    @Autowired
     private ModelMapper modelMapper;
+
     @Autowired
     private UserRepository userRepository;
+
+    @Autowired
+    private PricingService pricingService;
+
+    @Value("${app.baseUrl}")
+    private String baseUrl;
 
     @Override
     @Transactional
@@ -64,11 +82,14 @@ public class BookingServiceImpl implements BookingService {
 
         // TODO: Derive basePrice from PricingStrategy Impl
 
+        BigDecimal priceForOneRoom = pricingService.calculateTotalPrice(inventories);
+        BigDecimal totalPrice = priceForOneRoom.multiply(BigDecimal.valueOf(bookingRequest.getRooms()));
+
         Booking booking = Booking.builder()
                 .hotel(hotel)
                 .room(room)
                 .bookingStatus(BookingStatus.RESERVED)
-                .amount(BigDecimal.TEN) // WILL BE UPDATED LATER
+                .amount(totalPrice) // WILL BE UPDATED LATER
                 .checkInDate(bookingRequest.getCheckInDate())
                 .checkOutDate(bookingRequest.getCheckOutDate())
                 .user(getCurrentUser())
@@ -112,6 +133,58 @@ public class BookingServiceImpl implements BookingService {
         }
 
         return modelMapper.map(bookingRepository.save(booking), BookingDto.class);
+    }
+
+    @Override
+    public String initiatePayments(Long bookingId) {
+        Booking booking = bookingRepository.findById(bookingId).orElseThrow(
+                () -> new ResourceNotFoundException("Booking not found with id: "+bookingId)
+        );
+        User user = getCurrentUser();
+     /*   if (!user.equals(booking.getUser())) {
+            throw new RuntimeException("Booking does not belong to this user with id: "+user.getId());
+        }*/
+        if (isBookingExpired(booking)) {
+            throw new IllegalStateException("Booking has already expired");
+        }
+
+        String sessionUrl = checkoutService.getCheckoutSession(booking,
+                baseUrl+"/payments/" +bookingId +"/success",
+                baseUrl+"/payments/" +bookingId +"/failure");
+
+        booking.setBookingStatus(BookingStatus.PAYMENT_PENDING);
+        bookingRepository.save(booking);
+
+        return sessionUrl;
+    }
+
+    @Override
+    @Transactional
+    public void capturePayment(Event event) {
+
+        if ("checkout.session.completed".equals(event.getType())) {
+
+            String rawJson = event.getData().getObject().toJson();
+
+            JSONObject jsonObject = new JSONObject(rawJson);
+            String sessionId = jsonObject.getString("id");
+
+            Booking booking = bookingRepository.findByPaymentSessionId(sessionId)
+                    .orElseThrow(() -> new ResourceNotFoundException("Booking not found for sessionId: "+sessionId));
+
+            booking.setBookingStatus(BookingStatus.CONFIRMED);
+            bookingRepository.save(booking);
+
+            inventoryRepository.findAndLockReservedInventory(booking.getRoom().getId(), booking.getCheckInDate(),
+                    booking.getCheckOutDate(), booking.getRoomsCount());
+
+            inventoryRepository.confirmBooking(booking.getRoom().getId(), booking.getCheckInDate(),
+                    booking.getCheckOutDate(), booking.getRoomsCount());
+
+            log.info("Successfully confirmed the booking for Booking ID: {}", booking.getId());
+        } else {
+            log.warn("Unhandled event type: {}", event.getType());
+        }
     }
 
 
